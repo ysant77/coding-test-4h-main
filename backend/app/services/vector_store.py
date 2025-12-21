@@ -27,6 +27,11 @@ from app.models.document import DocumentChunk
 
 _ST_MODEL = None  # process-level cache
 
+def _to_pgvector_literal(vec: np.ndarray) -> str:
+    """Convert a vector to pgvector literal string, e.g. [0.1,0.2,...]."""
+    v = np.asarray(vec, dtype=np.float32).reshape(-1)
+    # keep it compact but deterministic
+    return "[" + ",".join(f"{float(x):.8f}" for x in v) + "]"
 
 def _pad_or_truncate(vec: np.ndarray, dim: int) -> np.ndarray:
     """Force embeddings to a fixed dimension.
@@ -160,22 +165,22 @@ class VectorStore:
         k = int(k or settings.TOP_K_RESULTS)
         k = max(1, min(k, 50))
 
-        q_emb = (await self.generate_embedding(query)).tolist()
-
+        q_emb = await self.generate_embedding(query)
+        q_lit = _to_pgvector_literal(q_emb)
         # Use SQL for predictable performance and simple score calculation.
         # <=> is cosine distance in pgvector. Similarity = 1 - distance.
         base_sql = """
-            SELECT
-                id,
-                content,
-                page_number,
-                chunk_index,
-                metadata,
-                1 - (embedding <=> :q) AS similarity
-            FROM document_chunks
-        """
+                SELECT
+                    id,
+                    content,
+                    page_number,
+                    chunk_index,
+                    metadata,
+                    1 - (embedding <=> (:q)::vector) AS similarity
+                FROM document_chunks
+            """
         where = ""
-        params: Dict[str, Any] = {"q": q_emb, "k": k}
+        params: Dict[str, Any] = {"q": q_lit, "k": k}
         if document_id is not None:
             where = "WHERE document_id = :doc_id"
             params["doc_id"] = int(document_id)
@@ -184,7 +189,7 @@ class VectorStore:
             base_sql
             + "\n"
             + where
-            + "\nORDER BY embedding <=> :q\nLIMIT :k"
+            + "\nORDER BY embedding <=> (:q)::vector\nLIMIT :k"
         )
         rows = self.db.execute(sql, params).mappings().all()
 
@@ -217,7 +222,7 @@ class VectorStore:
         image_ids: List[int] = []
         table_ids: List[int] = []
         for ch in q:
-            md = ch.metadata or {}
+            md = ch.meta or {}
             image_ids.extend(md.get("related_images", []) or [])
             table_ids.extend(md.get("related_tables", []) or [])
 

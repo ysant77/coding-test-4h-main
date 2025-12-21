@@ -15,10 +15,9 @@ pgvector==0.2.4
 redis==5.0.1
 
 # Docling (PDF Processing)
-# Docling (PDF Processing) - pinned to avoid slow resolver + missing tools
-docling==2.42.1
-docling-ibm-models==3.8.0
-deepsearch-glm==0.26.2
+docling==2.65.0
+docling-core[chunking]==2.57.0
+
 
 
 
@@ -28,11 +27,11 @@ openai==1.10.0
 langchain==0.1.6
 langchain-openai==0.0.5
 sentence-transformers==2.3.1
-deepsearch-toolkit
+deepsearch-toolkit==2.0.1
 # Utilities
 python-dotenv==1.0.0
 pydantic==2.7.0
-pydantic-settings==2.3.0
+pydantic-settings>=2.4.0,<3.0.0
 
 # Image Processing
 Pillow==10.2.0
