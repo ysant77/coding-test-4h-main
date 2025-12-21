@@ -22,4 +22,12 @@ COPY . .
 # Create uploads directory
 RUN mkdir -p uploads/documents uploads/images uploads/tables
 
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpoppler-cpp-dev \
+    poppler-utils \
+    curl \
+ && rm -rf /var/lib/apt/lists/*
+
+
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

@@ -15,9 +15,11 @@ pgvector==0.2.4
 redis==5.0.1
 
 # Docling (PDF Processing)
-docling>=2.18.0
-docling-ibm-models>=2.0.7
-deepsearch-glm>=0.26.2
+# Docling (PDF Processing) - pinned to avoid slow resolver + missing tools
+docling==2.42.1
+docling-ibm-models==3.8.0
+deepsearch-glm==0.26.2
+
 
 
 
