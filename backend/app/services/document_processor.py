@@ -205,47 +205,78 @@ class DocumentProcessor:
         except Exception:
             p = 0
         return p if p >= 0 else 0
+    
+    def _page_from_prov(self, item: Any) -> Optional[int]:
+        prov = getattr(item, "prov", None) or getattr(item, "provenance", None)
+        if not prov:
+            return None
+
+        # prov is a list; try each entry until we find a page-like field
+        candidates = prov if isinstance(prov, (list, tuple)) else [prov]
+
+        for pr in candidates:
+            # 1) dict-like
+            if isinstance(pr, dict):
+                for k in ("page_no", "page_num", "page_number", "page", "pageno"):
+                    if k in pr and pr[k] is not None:
+                        try:
+                            return int(pr[k])
+                        except Exception:
+                            pass
+
+            # 2) object-like
+            for attr in ("page_no", "page_num", "page_number", "page", "pageno"):
+                v = getattr(pr, attr, None)
+                if v is not None:
+                    try:
+                        return int(v)
+                    except Exception:
+                        pass
+
+            # 3) nested common patterns (best-effort)
+            for attr in ("page_info", "page"):
+                obj = getattr(pr, attr, None)
+                if obj is not None:
+                    for a2 in ("page_no", "page_num", "page_number", "page", "pageno"):
+                        v2 = getattr(obj, a2, None)
+                        if v2 is not None:
+                            try:
+                                return int(v2)
+                            except Exception:
+                                pass
+
+        return None
+
 
     # --------------------------- Image extraction ---------------------------
 
     async def _extract_images(self, doc: Any, document_id: int) -> Dict[int, List[int]]:
-        """
-        With PdfPipelineOptions.generate_picture_images=True,
-        Docling exposes images primarily as doc.pictures (and sometimes page.pictures).
-        """
         page_to_ids: Dict[int, List[int]] = {}
 
-        # Prefer pictures (Docling-native)
-        doc_pics = self._collect_items(doc, ["pictures"])
-        page_pics: List[Any] = []
-        for pi, p in enumerate(self._iter_doc_pages(doc), start=1):
-            items = self._collect_items(p, ["pictures"])
-            for it in items:
-                if getattr(it, "page_number", None) is None and getattr(it, "page", None) is None:
-                    try:
-                        setattr(it, "page_number", getattr(p, "page_number", None) or pi)
-                    except Exception:
-                        pass
-            page_pics.extend(items)
+        pictures = self._collect_items(doc, ["pictures"])
+        if not pictures:
+            return page_to_ids
 
-        # Fallback to older attribute names too
-        doc_level_fallback = self._collect_items(doc, ["images", "figures"])
-        page_level_fallback: List[Any] = []
-        for pi, p in enumerate(self._iter_doc_pages(doc), start=1):
-            items = self._collect_items(p, ["images", "figures"])
-            for it in items:
-                if getattr(it, "page_number", None) is None and getattr(it, "page", None) is None:
-                    try:
-                        setattr(it, "page_number", getattr(p, "page_number", None) or pi)
-                    except Exception:
-                        pass
-            page_level_fallback.extend(items)
+        for idx, pic in enumerate(pictures):
+            page = self._page_from_prov(pic)
+            page_key = self._norm_page(page)
 
-        images = doc_pics + page_pics + doc_level_fallback + page_level_fallback
+            # Your Docling objects expose image via `image` (per your output)
+            img = getattr(pic, "image", None)
 
-        for idx, img in enumerate(images):
-            page = self._norm_page(getattr(img, "page_number", None) or getattr(img, "page", None))
-            pil = self._to_pil_image(img)
+            # It might already be PIL OR might be bytes-like
+            pil = None
+            if isinstance(img, Image.Image):
+                pil = img.convert("RGB")
+            elif isinstance(img, (bytes, bytearray)):
+                try:
+                    pil = Image.open(io.BytesIO(img)).convert("RGB")
+                except Exception:
+                    pil = None
+            else:
+                # fallback to existing converter if you want
+                pil = self._to_pil_image(pic)
+
             if pil is None:
                 continue
 
@@ -256,19 +287,21 @@ class DocumentProcessor:
             rec = DocumentImage(
                 document_id=document_id,
                 file_path=out_path,
-                page_number=(page if page > 0 else None),
-                caption=getattr(img, "caption", None),
+                page_number=(page if page is not None else None),
+                caption=getattr(pic, "caption", None),
                 width=int(pil.width),
                 height=int(pil.height),
-                meta=self._safe_dict(getattr(img, "metadata", None)) or {"index": idx},
+                meta=self._safe_dict(getattr(pic, "metadata", None)) or {"index": idx},
             )
             self.db.add(rec)
             self.db.commit()
             self.db.refresh(rec)
 
-            page_to_ids.setdefault(page, []).append(rec.id)
+            page_to_ids.setdefault(page_key, []).append(rec.id)
 
         return page_to_ids
+
+
 
     def _to_pil_image(self, img_obj: Any) -> Optional[Image.Image]:
         # 1) Common Docling field: pil_image
@@ -314,36 +347,19 @@ class DocumentProcessor:
     # --------------------------- Table extraction ---------------------------
 
     async def _extract_tables(self, doc: Any, document_id: int) -> Dict[int, List[int]]:
-        """
-        Correct Docling table export path:
-          df = table.export_to_dataframe(doc=doc)
-        """
         page_to_ids: Dict[int, List[int]] = {}
 
-        doc_tables = self._collect_items(doc, ["tables"])
-        page_tables: List[Any] = []
-        for pi, p in enumerate(self._iter_doc_pages(doc), start=1):
-            items = self._collect_items(p, ["tables"])
-            for it in items:
-                if getattr(it, "page_number", None) is None and getattr(it, "page", None) is None:
-                    try:
-                        setattr(it, "page_number", getattr(p, "page_number", None) or pi)
-                    except Exception:
-                        pass
-            page_tables.extend(items)
-
-        tables = doc_tables + page_tables
+        tables = self._collect_items(doc, ["tables"])  # IMPORTANT: doc-level, works on your docling
+        if not tables:
+            return page_to_ids
 
         for idx, tbl in enumerate(tables):
-            page = self._norm_page(getattr(tbl, "page_number", None) or getattr(tbl, "page", None))
+            page = self._page_from_prov(tbl)  # best-effort
+            page_key = self._norm_page(page)
 
             structured = self._table_to_structured_docling(tbl, doc)
-
-            # If still empty, avoid producing blank table silently — store diagnostic
-            if not structured or not structured.get("rows"):
-                structured = structured or {}
-                structured.setdefault("rows", [])
-                structured.setdefault("diagnostic", "Docling table export produced no rows")
+            if not structured:
+                structured = {"rows": [], "diagnostic": "No structured rows from Docling export_to_dataframe"}
 
             img = self._render_table_image(structured, caption=getattr(tbl, "caption", None))
 
@@ -351,16 +367,16 @@ class DocumentProcessor:
             out_path = os.path.join(settings.UPLOAD_DIR, "tables", filename)
             img.save(out_path, format="PNG")
 
-            rows = len(structured.get("rows", [])) if structured else None
+            rows = len(structured.get("rows", []))
             cols = 0
-            if structured and structured.get("rows"):
+            if structured.get("rows"):
                 cols = max((len(r) if isinstance(r, list) else 1) for r in structured["rows"])
 
             rec = DocumentTable(
                 document_id=document_id,
                 image_path=out_path,
                 data=structured,
-                page_number=(page if page > 0 else None),
+                page_number=(page if page else None),
                 caption=getattr(tbl, "caption", None),
                 rows=rows,
                 columns=(cols or None),
@@ -370,9 +386,66 @@ class DocumentProcessor:
             self.db.commit()
             self.db.refresh(rec)
 
-            page_to_ids.setdefault(page, []).append(rec.id)
+            page_to_ids.setdefault(page_key, []).append(rec.id)
 
         return page_to_ids
+
+    def _infer_item_page(self, item: Any) -> Optional[int]:
+        """Best-effort page inference for Docling items."""
+        for attr in ("page_number", "page", "page_num"):
+            v = getattr(item, attr, None)
+            if v is not None:
+                try:
+                    return int(v)
+                except Exception:
+                    pass
+
+        # Docling often attaches provenance under .prov (or similar)
+        prov = getattr(item, "prov", None) or getattr(item, "provenance", None)
+        if prov is not None:
+            # prov might be list-like
+            try:
+                prov0 = prov[0] if isinstance(prov, (list, tuple)) and prov else prov
+            except Exception:
+                prov0 = prov
+            for attr in ("page_number", "page", "page_no", "page_num"):
+                v = getattr(prov0, attr, None)
+                if v is not None:
+                    try:
+                        return int(v)
+                    except Exception:
+                        pass
+            # prov might be dict-like
+            if isinstance(prov0, dict):
+                for k in ("page_number", "page", "page_no", "page_num"):
+                    if k in prov0:
+                        try:
+                            return int(prov0[k])
+                        except Exception:
+                            pass
+
+        return None
+
+
+    def _infer_bbox_xyxy(self, item: Any):
+        """Try to read bbox as (x0,y0,x1,y1). Returns None if not available."""
+        bbox = getattr(item, "bbox", None) or getattr(item, "bounding_box", None) or getattr(item, "box", None)
+        if bbox is None:
+            return None
+
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            return bbox
+
+        if isinstance(bbox, dict):
+            keys = ("x0", "y0", "x1", "y1")
+            if all(k in bbox for k in keys):
+                return (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
+
+        # object with x0,y0,x1,y1
+        try:
+            return (bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+        except Exception:
+            return None
 
     def _table_to_structured_docling(self, tbl: Any, doc: Any) -> Optional[Dict[str, Any]]:
         """
