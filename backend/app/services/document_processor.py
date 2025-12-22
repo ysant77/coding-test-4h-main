@@ -3,11 +3,11 @@ app.services.document_processor
 
 PDF processing using Docling.
 
-Fixes:
-- Robustly discovers images/tables at doc-level AND per-page (Docling version differences)
-- Normalizes page numbers (no more None-key vs 0-key mismatch)
-- Adds support for image objects that expose uri/path/file_path
-- Ensures related_images/related_tables metadata always resolves correctly
+Key fixes for Docling v2.65.0:
+- Configure PdfPipelineOptions so picture/page images + table structure are actually generated
+- Prefer doc.pictures (and page.pictures) as the main source for extracted images
+- Use Docling's official table API: table.export_to_dataframe(doc=doc)
+- Normalize page numbering and store it correctly (no more page=null unless truly unknown)
 """
 
 from __future__ import annotations
@@ -25,8 +25,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.document import Document, DocumentImage, DocumentTable
 from app.services.vector_store import VectorStore
+
 import logging
+
 log = logging.getLogger("docling_debug")
+
 
 @dataclass
 class _ExtractedText:
@@ -50,7 +53,6 @@ class DocumentProcessor:
 
         try:
             doc = self._load_docling_document(file_path)
-            
 
             # Extract media first so we can reference ids in chunk metadata
             page_to_image_ids = await self._extract_images(doc, document_id)
@@ -61,12 +63,12 @@ class DocumentProcessor:
 
             chunks: List[Dict[str, Any]] = []
             for item in extracted_text:
-                page = self._norm_page(item.page_number)  # always int >= 0
-                for ch in self._chunk_text(item.text, page_number=(page if page > 0 else None)):
+                page_key = self._norm_page(item.page_number)  # always int >= 0
+                for ch in self._chunk_text(item.text, page_number=(page_key if page_key > 0 else None)):
                     ch["metadata"] = {
                         **(ch.get("metadata") or {}),
-                        "related_images": page_to_image_ids.get(page, []),
-                        "related_tables": page_to_table_ids.get(page, []),
+                        "related_images": page_to_image_ids.get(page_key, []),
+                        "related_tables": page_to_table_ids.get(page_key, []),
                     }
                     chunks.append(ch)
 
@@ -92,6 +94,7 @@ class DocumentProcessor:
             }
 
         except Exception as e:
+            log.exception("process_document failed: %s", e)
             await self._update_document_status(document_id, "error", error_message=str(e))
             return {
                 "status": "error",
@@ -105,13 +108,45 @@ class DocumentProcessor:
     # --------------------------- Docling load ---------------------------
 
     def _load_docling_document(self, file_path: str) -> Any:
-        from docling.document_converter import DocumentConverter
+        """
+        Docling MUST be configured to generate images and table structure,
+        otherwise doc.pictures/doc.tables will exist but lack usable payloads.
+        """
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
 
-        converter = DocumentConverter()
+        # IMPORTANT: these options are what made your one-off test return pictures=6 tables=4
+        p = PdfPipelineOptions()
+        p.images_scale = 2.0
+        p.generate_picture_images = True
+        p.generate_page_images = True
+        p.do_table_structure = True
+
+        # If you want faster (less OCR), you can also consider:
+        # p.do_ocr = False  (depends on the PDF; keep default for now)
+
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=p)
+            }
+        )
+
         result = converter.convert(file_path)
+        doc = getattr(result, "document", None) or getattr(result, "doc", None) or result
 
-        # Different docling versions return different wrappers
-        return getattr(result, "document", None) or getattr(result, "doc", None) or result
+        # Optional small debug (won't crash even if attrs missing)
+        try:
+            pics = getattr(doc, "pictures", None) or []
+            tabs = getattr(doc, "tables", None) or []
+            log.info("Docling loaded: pages=%s pictures=%s tables=%s",
+                     len(getattr(doc, "pages", []) or []),
+                     len(pics),
+                     len(tabs))
+        except Exception:
+            pass
+
+        return doc
 
     # --------------------------- Text extraction ---------------------------
 
@@ -144,7 +179,7 @@ class DocumentProcessor:
 
         return [_ExtractedText(page_number=None, text=str(full))]
 
-    # --------------------------- Media discovery helpers ---------------------------
+    # --------------------------- Helpers ---------------------------
 
     def _iter_doc_pages(self, doc: Any) -> Iterable[Any]:
         pages = getattr(doc, "pages", None)
@@ -153,13 +188,11 @@ class DocumentProcessor:
                 yield p
 
     def _collect_items(self, obj: Any, attr_names: List[str]) -> List[Any]:
-        """Collect list-like items from first existing attr in attr_names."""
         for a in attr_names:
             v = getattr(obj, a, None)
             if v:
                 if isinstance(v, list):
                     return v
-                # sometimes tuple/iterable
                 try:
                     return list(v)
                 except Exception:
@@ -167,7 +200,6 @@ class DocumentProcessor:
         return []
 
     def _norm_page(self, page: Optional[int]) -> int:
-        """Normalize page into an int key: 0 means unknown; 1..N are real pages."""
         try:
             p = int(page) if page is not None else 0
         except Exception:
@@ -178,31 +210,38 @@ class DocumentProcessor:
 
     async def _extract_images(self, doc: Any, document_id: int) -> Dict[int, List[int]]:
         """
-        Robust extraction:
-        - Try doc-level image lists (images/pictures/figures)
-        - Also scan each page for images/pictures/figures
+        With PdfPipelineOptions.generate_picture_images=True,
+        Docling exposes images primarily as doc.pictures (and sometimes page.pictures).
         """
         page_to_ids: Dict[int, List[int]] = {}
 
-        # 1) doc-level
-        doc_level = (
-            self._collect_items(doc, ["images", "pictures", "figures"])
-        )
-
-        # 2) page-level
-        page_level: List[Any] = []
+        # Prefer pictures (Docling-native)
+        doc_pics = self._collect_items(doc, ["pictures"])
+        page_pics: List[Any] = []
         for pi, p in enumerate(self._iter_doc_pages(doc), start=1):
-            items = self._collect_items(p, ["images", "pictures", "figures"])
-            # best-effort attach page number if item lacks it
+            items = self._collect_items(p, ["pictures"])
             for it in items:
                 if getattr(it, "page_number", None) is None and getattr(it, "page", None) is None:
                     try:
                         setattr(it, "page_number", getattr(p, "page_number", None) or pi)
                     except Exception:
                         pass
-            page_level.extend(items)
+            page_pics.extend(items)
 
-        images = doc_level + page_level
+        # Fallback to older attribute names too
+        doc_level_fallback = self._collect_items(doc, ["images", "figures"])
+        page_level_fallback: List[Any] = []
+        for pi, p in enumerate(self._iter_doc_pages(doc), start=1):
+            items = self._collect_items(p, ["images", "figures"])
+            for it in items:
+                if getattr(it, "page_number", None) is None and getattr(it, "page", None) is None:
+                    try:
+                        setattr(it, "page_number", getattr(p, "page_number", None) or pi)
+                    except Exception:
+                        pass
+            page_level_fallback.extend(items)
+
+        images = doc_pics + page_pics + doc_level_fallback + page_level_fallback
 
         for idx, img in enumerate(images):
             page = self._norm_page(getattr(img, "page_number", None) or getattr(img, "page", None))
@@ -232,7 +271,7 @@ class DocumentProcessor:
         return page_to_ids
 
     def _to_pil_image(self, img_obj: Any) -> Optional[Image.Image]:
-        # 1) Already PIL
+        # 1) Common Docling field: pil_image
         for attr in ("pil_image", "image", "value"):
             v = getattr(img_obj, attr, None)
             if isinstance(v, Image.Image):
@@ -250,10 +289,8 @@ class DocumentProcessor:
         for attr in ("uri", "path", "file_path", "filepath", "filename"):
             p = getattr(img_obj, attr, None)
             if isinstance(p, str) and p:
-                # handle file://... and plain paths
                 if p.startswith("file://"):
                     p = p.replace("file://", "", 1)
-                # relative paths from cwd
                 p = os.path.expanduser(p)
                 if os.path.exists(p):
                     try:
@@ -278,17 +315,15 @@ class DocumentProcessor:
 
     async def _extract_tables(self, doc: Any, document_id: int) -> Dict[int, List[int]]:
         """
-        Robust extraction:
-        - Try doc-level tables
-        - Also scan each page for tables
-        - Normalize page key so chunk metadata lookup always works
+        Correct Docling table export path:
+          df = table.export_to_dataframe(doc=doc)
         """
         page_to_ids: Dict[int, List[int]] = {}
 
-        doc_tables = self._collect_items(doc, ["tables", "table"])
+        doc_tables = self._collect_items(doc, ["tables"])
         page_tables: List[Any] = []
         for pi, p in enumerate(self._iter_doc_pages(doc), start=1):
-            items = self._collect_items(p, ["tables", "table"])
+            items = self._collect_items(p, ["tables"])
             for it in items:
                 if getattr(it, "page_number", None) is None and getattr(it, "page", None) is None:
                     try:
@@ -302,20 +337,13 @@ class DocumentProcessor:
         for idx, tbl in enumerate(tables):
             page = self._norm_page(getattr(tbl, "page_number", None) or getattr(tbl, "page", None))
 
-            structured = self._table_to_structured(tbl)
+            structured = self._table_to_structured_docling(tbl, doc)
 
-            # If Docling gives a table object but we can't parse rows, at least render its text-ish representation
+            # If still empty, avoid producing blank table silently — store diagnostic
             if not structured or not structured.get("rows"):
-                fallback_txt = None
-                for attr in ("text", "content", "raw_text"):
-                    v = getattr(tbl, attr, None)
-                    if isinstance(v, str) and v.strip():
-                        fallback_txt = v.strip()
-                        break
-                if fallback_txt:
-                    structured = {"rows": [[fallback_txt]]}
-                else:
-                    structured = structured or {"rows": []}
+                structured = structured or {}
+                structured.setdefault("rows", [])
+                structured.setdefault("diagnostic", "Docling table export produced no rows")
 
             img = self._render_table_image(structured, caption=getattr(tbl, "caption", None))
 
@@ -346,7 +374,27 @@ class DocumentProcessor:
 
         return page_to_ids
 
-    def _table_to_structured(self, tbl: Any) -> Optional[Dict[str, Any]]:
+    def _table_to_structured_docling(self, tbl: Any, doc: Any) -> Optional[Dict[str, Any]]:
+        """
+        Use Docling's official table -> dataframe exporter.
+        Requires pandas installed in the backend container.
+        """
+        # Docling preferred API
+        f = getattr(tbl, "export_to_dataframe", None)
+        if callable(f):
+            try:
+                df = f(doc=doc)  # <-- the important part
+                # Normalize to strings so JSON is safe
+                rows = df.astype(str).values.tolist()
+                cols = [str(c) for c in getattr(df, "columns", [])]
+                return {"columns": cols, "rows": rows}
+            except Exception as e:
+                log.warning("export_to_dataframe failed: %s", e)
+
+        # Fallback to your older logic if needed
+        return self._table_to_structured_fallback(tbl)
+
+    def _table_to_structured_fallback(self, tbl: Any) -> Optional[Dict[str, Any]]:
         if tbl is None:
             return None
 
@@ -356,37 +404,6 @@ class DocumentProcessor:
             if "data" in tbl and isinstance(tbl["data"], list):
                 return {"rows": tbl["data"]}
             return tbl
-
-        for fn in ("to_dict", "as_dict", "export_to_dict"):
-            f = getattr(tbl, fn, None)
-            if callable(f):
-                try:
-                    d = f()
-                    if isinstance(d, dict):
-                        if "rows" in d:
-                            return d
-                        if "data" in d and isinstance(d["data"], list):
-                            return {"rows": d["data"]}
-                        return d
-                except Exception:
-                    pass
-
-        for fn in ("to_pandas", "to_dataframe"):
-            f = getattr(tbl, fn, None)
-            if callable(f):
-                try:
-                    df = f()
-                    return {"rows": df.astype(str).values.tolist()}
-                except Exception:
-                    pass
-
-        for attr in ("df", "dataframe"):
-            df = getattr(tbl, attr, None)
-            if df is not None:
-                try:
-                    return {"rows": df.astype(str).values.tolist()}
-                except Exception:
-                    pass
 
         cells = getattr(tbl, "cells", None)
         if cells and isinstance(cells, list):
@@ -425,9 +442,8 @@ class DocumentProcessor:
         return None
 
     def _render_table_image(self, structured: Dict[str, Any], caption: Optional[str]) -> Image.Image:
-        rows = structured.get("rows") or structured.get("data") or []
-        if isinstance(rows, dict):
-            rows = [[str(k), str(v)] for k, v in rows.items()]
+        rows = structured.get("rows") or []
+        cols = structured.get("columns") or []
 
         try:
             font = ImageFont.load_default()
@@ -437,6 +453,8 @@ class DocumentProcessor:
         lines: List[str] = []
         if caption:
             lines.append(str(caption))
+        if cols:
+            lines.append(" | ".join(str(c) for c in cols))
 
         for r in rows[:60]:
             if isinstance(r, (list, tuple)):
@@ -448,14 +466,14 @@ class DocumentProcessor:
             lines = ["(empty table)"]
 
         line_h = 14
-        w = 1200
-        h = min(2200, max(200, 20 + line_h * (len(lines) + 1)))
+        w = 1400
+        h = min(2400, max(220, 20 + line_h * (len(lines) + 1)))
         img = Image.new("RGB", (w, h), "white")
         draw = ImageDraw.Draw(img)
 
         y = 10
         for ln in lines:
-            draw.text((10, y), ln[:2000], fill="black", font=font)
+            draw.text((10, y), ln[:3000], fill="black", font=font)
             y += line_h
 
         return img
