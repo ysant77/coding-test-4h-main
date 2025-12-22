@@ -76,36 +76,20 @@ class ChatEngine:
         return await self.vector_store.search_similar(query=query, document_id=document_id, k=k)
 
     async def _find_related_media(self, context_chunks: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        image_ids: List[int] = []
-        table_ids: List[int] = []
+        import os
 
+        # pages from retrieved chunks
+        pages = []
         for ch in context_chunks:
-            md = ch.get("metadata") or {}
-            image_ids.extend(md.get("related_images", []) or [])
-            table_ids.extend(md.get("related_tables", []) or [])
+            p = ch.get("page_number")
+            if isinstance(p, int) and p > 0:
+                pages.append(p)
+        pages = sorted(set(pages))[:6]  # cap pages to avoid huge media pulls
 
-        # De-dupe while preserving order
-        def _uniq(xs: List[int]) -> List[int]:
-            seen = set()
-            out: List[int] = []
-            for x in xs:
-                if x in seen:
-                    continue
-                seen.add(x)
-                out.append(x)
-            return out
-
-        image_ids = _uniq([int(x) for x in image_ids if x is not None])
-        table_ids = _uniq([int(x) for x in table_ids if x is not None])
-
-        images: List[Dict[str, Any]] = []
-        if image_ids:
-            rows = self.db.query(DocumentImage).filter(DocumentImage.id.in_(image_ids)).all()
-            by_id = {r.id: r for r in rows}
-            for i in image_ids:
-                r = by_id.get(i)
-                if not r:
-                    continue
+        images = []
+        if pages:
+            rows = self.db.query(DocumentImage).filter(DocumentImage.page_number.in_(pages)).all()
+            for r in rows[:8]:
                 images.append(
                     {
                         "id": r.id,
@@ -115,14 +99,10 @@ class ChatEngine:
                     }
                 )
 
-        tables: List[Dict[str, Any]] = []
-        if table_ids:
-            rows = self.db.query(DocumentTable).filter(DocumentTable.id.in_(table_ids)).all()
-            by_id = {r.id: r for r in rows}
-            for t in table_ids:
-                r = by_id.get(t)
-                if not r:
-                    continue
+        tables = []
+        if pages:
+            rows = self.db.query(DocumentTable).filter(DocumentTable.page_number.in_(pages)).all()
+            for r in rows[:8]:
                 tables.append(
                     {
                         "id": r.id,
@@ -135,6 +115,7 @@ class ChatEngine:
 
         return {"images": images, "tables": tables}
 
+
     async def _generate_response(
         self,
         message: str,
@@ -146,17 +127,27 @@ class ChatEngine:
         ctx_lines: List[str] = []
         for i, ch in enumerate(context[:8], start=1):
             page = ch.get("page_number")
+            page_str = str(page) if page else "unknown"
             score = ch.get("score")
             snippet = (ch.get("content") or "").strip()
             snippet = snippet[:1200]
-            ctx_lines.append(f"[{i}] (page {page}, score {score:.3f}) {snippet}")
+            ctx_lines.append(f"[{i}] (page {page_str}, score {score:.3f}) {snippet}")
         ctx_block = "\n\n".join(ctx_lines) if ctx_lines else "(no relevant context found)"
 
         media_hint = []
         if media.get("images"):
             media_hint.append(f"Images available: {len(media['images'])} (refer by page when relevant)")
+        table_block = ""
         if media.get("tables"):
-            media_hint.append(f"Tables available: {len(media['tables'])} (refer by page when relevant)")
+            lines = []
+            for t in media["tables"][:3]:
+                cap = (t.get("caption") or "").strip()
+                pg = t.get("page")
+                data = t.get("data") or []
+                # keep it compact
+                preview = data[:8] if isinstance(data, list) else []
+                lines.append(f"- Table (page {pg}) {cap}\n  preview: {preview}")
+            table_block = "\n\nTables preview:\n" + "\n".join(lines)
         media_hint_block = "\n".join(media_hint) if media_hint else "No images/tables extracted for this context."
 
         system = (
@@ -165,11 +156,13 @@ class ChatEngine:
             "If the answer is not in the context, say you don't know. "
             "When useful, mention relevant pages and refer to tables/figures by page."
         )
+        
 
         user = (
             f"User question: {message}\n\n"
             f"Retrieved context:\n{ctx_block}\n\n"
             f"Media info:\n{media_hint_block}\n\n"
+            f"{table_block}\n\n"
             "Answer clearly and concisely."
         )
 

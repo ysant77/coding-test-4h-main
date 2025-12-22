@@ -108,7 +108,14 @@ class VectorStore:
         stored = 0
         for ch in chunks:
             content = ch.get("content") or ""
-            page_number = int(ch.get("page_number") or 0) or None
+            raw_page = ch.get("page_number", None)
+            page_number = None
+            if raw_page and str(raw_page).strip() != "":
+                try:
+                    p = int(raw_page)
+                    page_number = p if p > 0 else None
+                except Exception:
+                    pass
             chunk_index = int(ch.get("chunk_index") or stored)
             metadata = ch.get("metadata") or {}
             await self.store_chunk(

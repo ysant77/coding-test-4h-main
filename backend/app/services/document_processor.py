@@ -61,12 +61,14 @@ class DocumentProcessor:
 
             chunks: List[Dict[str, Any]] = []
             for item in extracted_text:
-                page_key = self._norm_page(item.page_number)  # always int >= 0
-                for ch in self._chunk_text(item.text, page_number=(page_key if page_key > 0 else None)):
+                raw_page = item.page_number
+                page_key = int(raw_page) if isinstance(raw_page, int) and raw_page > 0 else None
+
+                for ch in self._chunk_text(item.text, page_number=page_key):
                     ch["metadata"] = {
                         **(ch.get("metadata") or {}),
-                        "related_images": page_to_image_ids.get(page_key, []),
-                        "related_tables": page_to_table_ids.get(page_key, []),
+                        "related_images": page_to_image_ids.get(page_key, []) if page_key else [],
+                        "related_tables": page_to_table_ids.get(page_key, []) if page_key else [],
                     }
                     chunks.append(ch)
 
@@ -146,25 +148,47 @@ class DocumentProcessor:
     # --------------------------- Text extraction ---------------------------
 
     def _extract_text(self, doc: Any) -> List[_ExtractedText]:
-        pages = getattr(doc, "pages", None)
         out: List[_ExtractedText] = []
 
+        pages = getattr(doc, "pages", None)
         if pages:
             for i, p in enumerate(pages, start=1):
                 txt = getattr(p, "text", None)
+
                 if callable(getattr(p, "export_to_text", None)):
                     txt = p.export_to_text()
-                if txt is None and callable(getattr(p, "to_text", None)):
+                elif callable(getattr(p, "to_text", None)):
                     txt = p.to_text()
+
+                txt = (txt or "").strip()
                 if not txt:
                     continue
-                page_num = getattr(p, "page_number", None) or i
-                out.append(_ExtractedText(page_number=int(page_num), text=str(txt)))
+
+                # --- Prefer provenance page_no if present ---
+                page_num = None
+                prov = getattr(p, "prov", None)
+                if prov and isinstance(prov, list) and len(prov) > 0:
+                    page_num = getattr(prov[0], "page_no", None)
+
+                # --- Fallbacks ---
+                if page_num is None:
+                    page_num = getattr(p, "page_number", None)
+                if page_num is None:
+                    page_num = i
+
+                try:
+                    page_num = int(page_num)
+                    if page_num <= 0:
+                        page_num = None
+                except Exception:
+                    page_num = None
+
+                out.append(_ExtractedText(page_number=page_num, text=txt))
 
         if out:
             return out
 
-        # Fallback full-doc text
+        # Fallback full-doc text (page unknown)
         if callable(getattr(doc, "export_to_text", None)):
             full = doc.export_to_text()
         elif callable(getattr(doc, "export_to_markdown", None)):
@@ -172,7 +196,9 @@ class DocumentProcessor:
         else:
             full = getattr(doc, "text", "") or ""
 
-        return [_ExtractedText(page_number=None, text=str(full))]
+        full = (full or "").strip()
+        return [_ExtractedText(page_number=None, text=full)] if full else []
+
 
     # --------------------------- Helpers ---------------------------
 
