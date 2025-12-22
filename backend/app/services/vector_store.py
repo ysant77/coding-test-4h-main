@@ -1,4 +1,4 @@
-"""app.services.vector_store
+"""
 
 Vector store service using PostgreSQL + pgvector.
 
