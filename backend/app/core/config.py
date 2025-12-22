@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # When running backend in Docker, "http://host.docker.internal:11434" works on macOS/Windows.
     # On Linux, you may need to use the Docker bridge gateway IP (often "http://172.17.0.1:11434").
     OLLAMA_BASE_URL: str = "http://host.docker.internal:11434"
-    OLLAMA_MODEL: str = "llama3.1:8b"
+    OLLAMA_MODEL: str = "llama3.2:3b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
     
     # Upload Settings

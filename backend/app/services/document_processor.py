@@ -188,7 +188,8 @@ class DocumentProcessor:
         tables = getattr(doc, "tables", None) or getattr(doc, "table", None) or []
 
         for idx, tbl in enumerate(tables):
-            page = int(getattr(tbl, "page_number", None) or getattr(tbl, "page", None) or 0)
+            page = getattr(tbl, "page_number", None) or getattr(tbl, "page", None)
+            page = int(page) if page is not None else None
 
             structured = self._table_to_structured(tbl)
             img = self._render_table_image(structured or {"rows": []}, caption=getattr(tbl, "caption", None))
@@ -206,7 +207,7 @@ class DocumentProcessor:
                 document_id=document_id,
                 image_path=out_path,
                 data=structured,
-                page_number=page or None,
+                page_number=page,
                 caption=getattr(tbl, "caption", None),
                 rows=rows,
                 columns=cols or None,
@@ -283,29 +284,96 @@ class DocumentProcessor:
         return None
 
     def _table_to_structured(self, tbl: Any) -> Optional[Dict[str, Any]]:
-        # Attempt to get a python-native structure.
+        """
+        Convert a Docling table object into a simple structured dict:
+        {"rows": [[...], [...], ...]}
+        """
+        if tbl is None:
+            return None
+
+        # 1) Already structured
         if isinstance(tbl, dict):
+            if "rows" in tbl:
+                return tbl
+            # common alt keys
+            if "data" in tbl and isinstance(tbl["data"], list):
+                return {"rows": tbl["data"]}
             return tbl
+
+        # 2) Common helpers
         for fn in ("to_dict", "as_dict", "export_to_dict"):
             f = getattr(tbl, fn, None)
             if callable(f):
                 try:
                     d = f()
                     if isinstance(d, dict):
+                        if "rows" in d:
+                            return d
+                        if "data" in d and isinstance(d["data"], list):
+                            return {"rows": d["data"]}
                         return d
                 except Exception:
                     pass
+
+        # 3) Pandas dataframe helpers
+        for fn in ("to_pandas", "to_dataframe"):
+            f = getattr(tbl, fn, None)
+            if callable(f):
+                try:
+                    df = f()
+                    # df.values -> list-of-lists
+                    return {"rows": df.astype(str).values.tolist()}
+                except Exception:
+                    pass
+
+        # 4) Sometimes it's exposed as attributes
+        for attr in ("df", "dataframe"):
+            df = getattr(tbl, attr, None)
+            if df is not None:
+                try:
+                    return {"rows": df.astype(str).values.tolist()}
+                except Exception:
+                    pass
+
+        # 5) Cell-based tables (row/col indexed cells)
+        cells = getattr(tbl, "cells", None)
+        if cells and isinstance(cells, list):
+            try:
+                # Expect each cell has row/col and text/value
+                tmp = {}
+                max_r = 0
+                max_c = 0
+                for c in cells:
+                    r = int(getattr(c, "row", getattr(c, "row_idx", 0)) or 0)
+                    k = int(getattr(c, "col", getattr(c, "col_idx", 0)) or 0)
+                    v = getattr(c, "text", None) or getattr(c, "value", None) or ""
+                    tmp[(r, k)] = str(v)
+                    max_r = max(max_r, r)
+                    max_c = max(max_c, k)
+
+                rows = []
+                for r in range(max_r + 1):
+                    row = []
+                    for k in range(max_c + 1):
+                        row.append(tmp.get((r, k), ""))
+                    rows.append(row)
+                return {"rows": rows}
+            except Exception:
+                pass
+
+        # 6) Last fallback: attribute `data`
         data = getattr(tbl, "data", None)
         if isinstance(data, dict):
+            if "rows" in data:
+                return data
+            if "data" in data and isinstance(data["data"], list):
+                return {"rows": data["data"]}
             return data
-        if data is None:
-            return None
-
-        # try list-of-lists
         if isinstance(data, list):
             return {"rows": data}
 
         return None
+
 
     def _render_table_image(self, structured: Dict[str, Any], caption: Optional[str]) -> Image.Image:
         rows = structured.get("rows") or structured.get("data") or []

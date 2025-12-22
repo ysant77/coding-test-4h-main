@@ -46,7 +46,7 @@ services:
       - UPLOAD_DIR=/app/uploads
     volumes:
       - ./backend:/app
-      - backend_uploads:/app/uploads
+      - ./backend/uploads:/app/uploads:/app/uploads
       - hf_cache:/root/.cache/huggingface
       - docling_cache:/root/.cache/docling
     depends_on:
