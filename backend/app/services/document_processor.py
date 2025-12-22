@@ -54,11 +54,9 @@ class DocumentProcessor:
         try:
             doc = self._load_docling_document(file_path)
 
-            # Extract media first so we can reference ids in chunk metadata
             page_to_image_ids = await self._extract_images(doc, document_id)
             page_to_table_ids = await self._extract_tables(doc, document_id)
 
-            # Extract text, chunk, and store embeddings
             extracted_text = self._extract_text(doc)
 
             chunks: List[Dict[str, Any]] = []
@@ -116,16 +114,13 @@ class DocumentProcessor:
         from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.document_converter import DocumentConverter, PdfFormatOption
 
-        # IMPORTANT: these options are what made your one-off test return pictures=6 tables=4
         p = PdfPipelineOptions()
         p.images_scale = 2.0
         p.generate_picture_images = True
         p.generate_page_images = True
         p.do_table_structure = True
 
-        # If you want faster (less OCR), you can also consider:
-        # p.do_ocr = False  (depends on the PDF; keep default for now)
-
+        
         converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=p)
@@ -135,7 +130,7 @@ class DocumentProcessor:
         result = converter.convert(file_path)
         doc = getattr(result, "document", None) or getattr(result, "doc", None) or result
 
-        # Optional small debug (won't crash even if attrs missing)
+        
         try:
             pics = getattr(doc, "pictures", None) or []
             tabs = getattr(doc, "tables", None) or []
@@ -251,6 +246,9 @@ class DocumentProcessor:
     # --------------------------- Image extraction ---------------------------
 
     async def _extract_images(self, doc: Any, document_id: int) -> Dict[int, List[int]]:
+        import os, uuid
+        from PIL import Image
+
         page_to_ids: Dict[int, List[int]] = {}
 
         pictures = self._collect_items(doc, ["pictures"])
@@ -258,27 +256,23 @@ class DocumentProcessor:
             return page_to_ids
 
         for idx, pic in enumerate(pictures):
-            page = self._page_from_prov(pic)
-            page_key = self._norm_page(page)
-
-            # Your Docling objects expose image via `image` (per your output)
-            img = getattr(pic, "image", None)
-
-            # It might already be PIL OR might be bytes-like
-            pil = None
-            if isinstance(img, Image.Image):
-                pil = img.convert("RGB")
-            elif isinstance(img, (bytes, bytearray)):
+            page_no = None
+            prov = getattr(pic, "prov", None)
+            if prov and isinstance(prov, list):
+                pr0 = prov[0]
+                page_no = getattr(pr0, "page_no", None)
                 try:
-                    pil = Image.open(io.BytesIO(img)).convert("RGB")
+                    page_no = int(page_no) if page_no is not None else None
                 except Exception:
-                    pil = None
-            else:
-                # fallback to existing converter if you want
-                pil = self._to_pil_image(pic)
+                    page_no = None
 
-            if pil is None:
+            img_ref = getattr(pic, "image", None)
+            pil = getattr(img_ref, "pil_image", None)
+
+            if not isinstance(pil, Image.Image):
                 continue
+
+            pil = pil.convert("RGB")
 
             filename = f"{uuid.uuid4().hex}.png"
             out_path = os.path.join(settings.UPLOAD_DIR, "images", filename)
@@ -287,7 +281,7 @@ class DocumentProcessor:
             rec = DocumentImage(
                 document_id=document_id,
                 file_path=out_path,
-                page_number=(page if page is not None else None),
+                page_number=(page_no if page_no is not None else None),
                 caption=getattr(pic, "caption", None),
                 width=int(pil.width),
                 height=int(pil.height),
@@ -297,20 +291,22 @@ class DocumentProcessor:
             self.db.commit()
             self.db.refresh(rec)
 
+            page_key = self._norm_page(page_no)
             page_to_ids.setdefault(page_key, []).append(rec.id)
 
         return page_to_ids
 
 
 
+
     def _to_pil_image(self, img_obj: Any) -> Optional[Image.Image]:
-        # 1) Common Docling field: pil_image
+        
         for attr in ("pil_image", "image", "value"):
             v = getattr(img_obj, attr, None)
             if isinstance(v, Image.Image):
                 return v
 
-        # 2) bytes-like
+        
         raw = getattr(img_obj, "data", None) or getattr(img_obj, "bytes", None)
         if isinstance(raw, (bytes, bytearray)):
             try:
@@ -318,7 +314,7 @@ class DocumentProcessor:
             except Exception:
                 return None
 
-        # 3) uri/path/file_path
+        
         for attr in ("uri", "path", "file_path", "filepath", "filename"):
             p = getattr(img_obj, attr, None)
             if isinstance(p, str) and p:
@@ -331,7 +327,7 @@ class DocumentProcessor:
                     except Exception:
                         pass
 
-        # 4) conversion method
+        
         for fn in ("to_pil", "to_pil_image"):
             f = getattr(img_obj, fn, None)
             if callable(f):
@@ -349,12 +345,12 @@ class DocumentProcessor:
     async def _extract_tables(self, doc: Any, document_id: int) -> Dict[int, List[int]]:
         page_to_ids: Dict[int, List[int]] = {}
 
-        tables = self._collect_items(doc, ["tables"])  # IMPORTANT: doc-level, works on your docling
+        tables = self._collect_items(doc, ["tables"])
         if not tables:
             return page_to_ids
 
         for idx, tbl in enumerate(tables):
-            page = self._page_from_prov(tbl)  # best-effort
+            page = self._page_from_prov(tbl)  
             page_key = self._norm_page(page)
 
             structured = self._table_to_structured_docling(tbl, doc)
@@ -400,10 +396,10 @@ class DocumentProcessor:
                 except Exception:
                     pass
 
-        # Docling often attaches provenance under .prov (or similar)
+        
         prov = getattr(item, "prov", None) or getattr(item, "provenance", None)
         if prov is not None:
-            # prov might be list-like
+            
             try:
                 prov0 = prov[0] if isinstance(prov, (list, tuple)) and prov else prov
             except Exception:
@@ -415,7 +411,7 @@ class DocumentProcessor:
                         return int(v)
                     except Exception:
                         pass
-            # prov might be dict-like
+            
             if isinstance(prov0, dict):
                 for k in ("page_number", "page", "page_no", "page_num"):
                     if k in prov0:
@@ -441,7 +437,7 @@ class DocumentProcessor:
             if all(k in bbox for k in keys):
                 return (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
 
-        # object with x0,y0,x1,y1
+        
         try:
             return (bbox.x0, bbox.y0, bbox.x1, bbox.y1)
         except Exception:
@@ -452,19 +448,19 @@ class DocumentProcessor:
         Use Docling's official table -> dataframe exporter.
         Requires pandas installed in the backend container.
         """
-        # Docling preferred API
+       
         f = getattr(tbl, "export_to_dataframe", None)
         if callable(f):
             try:
-                df = f(doc=doc)  # <-- the important part
-                # Normalize to strings so JSON is safe
+                df = f(doc=doc)  
+               
                 rows = df.astype(str).values.tolist()
                 cols = [str(c) for c in getattr(df, "columns", [])]
                 return {"columns": cols, "rows": rows}
             except Exception as e:
                 log.warning("export_to_dataframe failed: %s", e)
 
-        # Fallback to your older logic if needed
+       
         return self._table_to_structured_fallback(tbl)
 
     def _table_to_structured_fallback(self, tbl: Any) -> Optional[Dict[str, Any]]:
