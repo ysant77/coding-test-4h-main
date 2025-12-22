@@ -50,27 +50,7 @@ class DocumentProcessor:
 
         try:
             doc = self._load_docling_document(file_path)
-            log.warning("DOC type=%s has pages=%s has doc.images=%s doc.tables=%s",
-            type(doc),
-            hasattr(doc, "pages"),
-            hasattr(doc, "images"),
-            hasattr(doc, "tables"))
-
-            pages = getattr(doc, "pages", None)
-            log.warning("DOC pages len=%s", len(pages) if pages else None)
-
-            if pages:
-                p0 = pages[0]
-                log.warning("PAGE0 type=%s attrs=%s",
-                            type(p0),
-                            [a for a in ["page_number","images","pictures","figures","tables","text"] if hasattr(p0,a)])
-
-                for k in ["images","pictures","figures","tables"]:
-                    v = getattr(p0, k, None)
-                    try:
-                        log.warning("PAGE0 %s len=%s", k, len(v) if v else None)
-                    except Exception:
-                        log.warning("PAGE0 %s exists but not len()-able", k)
+            
 
             # Extract media first so we can reference ids in chunk metadata
             page_to_image_ids = await self._extract_images(doc, document_id)
