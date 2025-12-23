@@ -580,7 +580,7 @@ class DocumentProcessor:
         if not text:
             return []
 
-        size = max(200, int(settings.CHUNK_SIZE))
+        size = max(400, int(settings.CHUNK_SIZE))
         overlap = max(0, min(int(settings.CHUNK_OVERLAP), size - 1))
 
         chunks: List[Dict[str, Any]] = []

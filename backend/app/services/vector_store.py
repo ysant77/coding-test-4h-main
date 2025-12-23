@@ -67,6 +67,14 @@ class VectorStore:
     def __init__(self, db: Session):
         self.db = db
         self._ensure_extension()
+    
+    async def store_text_chunks(self, chunks: List[Dict[str, Any]], document_id: int) -> int:
+        """
+        Compatibility method expected by DocumentProcessor.
+        It stores the passed chunks with embeddings and returns how many were stored.
+        """
+        return await self.store_chunks(document_id=document_id, chunks=chunks)
+
 
     def _ensure_extension(self) -> None:
         """Ensure pgvector extension is enabled."""

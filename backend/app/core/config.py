@@ -35,9 +35,13 @@ class Settings(BaseSettings):
     # Vector Store Settings
     # Vector Store Settings
     EMBEDDING_DIMENSION: int = 384          # was 1536
-    TOP_K_RESULTS: int = 12                # was 5
-    CHUNK_SIZE: int = 1200                 # optional but recommended
-    CHUNK_OVERLAP: int = 200               # keep as-is or 200-250
+    TOP_K_RESULTS: int = 16                # was 5
+    CHUNK_SIZE: int = 1800                 # optional but recommended
+    CHUNK_OVERLAP: int = 250               # keep as-is or 200-250
+    ENABLE_RERANKER : bool = True
+    RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    LOCAL_EMBED_MODEL:str = "BAAI/bge-small-en-v1.5"
+    
 
     
     class Config:
