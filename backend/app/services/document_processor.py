@@ -317,9 +317,10 @@ class DocumentProcessor:
             self.db.commit()
             self.db.refresh(rec)
 
-            page_key = self._norm_page(page_no)
-            page_to_ids.setdefault(page_key, []).append(rec.id)
-
+            # page_key = self._norm_page(page_no)
+            # page_to_ids.setdefault(page_key, []).append(rec.id)
+            if page_no and int(page_no) > 0:
+                page_to_ids.setdefault(int(page_no), []).append(rec.id)
         return page_to_ids
 
 
