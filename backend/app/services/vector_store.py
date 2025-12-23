@@ -1,16 +1,11 @@
 """
-
 Vector store service using PostgreSQL + pgvector.
 
-This module provides:
-- Embedding generation (OpenAI if configured, otherwise local sentence-transformers)
-- Storage of document chunks with embeddings
-- Similarity search (cosine distance)
-
-Design goals:
-- Keep the API small and testable
-- Be resilient when OpenAI isn't configured
-- Keep embeddings dimension fixed to the DB schema (Vector(1536))
+Improvements vs previous:
+- Strong local embeddings by default (BGE small, 384-d)
+- No "zero-padding to 1536" hacks (dimension must match DB schema)
+- Filters out reference/bibliography chunks by metadata + heuristics
+- Similarity search with stable SQL and cosine distance
 """
 
 from __future__ import annotations
@@ -24,29 +19,46 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.document import DocumentChunk
 
+# Process-level cache for local embedding model
+_ST_MODEL = None
 
-_ST_MODEL = None  # process-level cache
 
 def _to_pgvector_literal(vec: np.ndarray) -> str:
-    """Convert a vector to pgvector literal string, e.g. [0.1,0.2,...]."""
+    """Convert a numpy vector to pgvector literal string, e.g. [0.1,0.2,0.3]."""
     v = np.asarray(vec, dtype=np.float32).reshape(-1)
-    # keep it compact but deterministic
-    return "[" + ",".join(f"{float(x):.8f}" for x in v) + "]"
+    return "[" + ",".join(f"{x:.8f}" for x in v.tolist()) + "]"
 
-def _pad_or_truncate(vec: np.ndarray, dim: int) -> np.ndarray:
-    """Force embeddings to a fixed dimension.
 
-    The DB schema uses Vector(1536). Some local embedding models produce
-    different dimensions; we pad with zeros or truncate.
+def _looks_like_references(text_block: str) -> bool:
     """
-    vec = np.asarray(vec, dtype=np.float32).reshape(-1)
-    if vec.shape[0] == dim:
-        return vec
-    if vec.shape[0] > dim:
-        return vec[:dim]
-    out = np.zeros((dim,), dtype=np.float32)
-    out[: vec.shape[0]] = vec
-    return out
+    Heuristic filter: references/bibliography sections are high-frequency retrieval junk
+    for questions like "architecture diagram" / "conclusion".
+    """
+    t = (text_block or "").strip().lower()
+    if not t:
+        return False
+
+    head = t[:4000]  # only need first chunk
+    triggers = [
+        "references",
+        "bibliography",
+        "works cited",
+        "reference",
+        "acknowledg",  # acknowledgement(s)
+    ]
+    if any(x in head[:250] for x in triggers):
+        return True
+
+    # Stronger heuristic: lots of citations patterns like [12], [3], et al., year-heavy
+    bracket_cites = head.count("[") + head.count("]")
+    year_hits = sum(head.count(str(y)) for y in range(1990, 2031))
+    etal_hits = head.count("et al")
+
+    # If it's mostly citation soup, mark as references-like
+    if bracket_cites >= 30 and (year_hits >= 15 or etal_hits >= 8):
+        return True
+
+    return False
 
 
 class VectorStore:
@@ -65,59 +77,100 @@ class VectorStore:
             self.db.rollback()
 
     async def generate_embedding(self, content: str) -> np.ndarray:
-        """Generate an embedding for the provided content.
+        """
+        Generate embedding for content.
 
         Preference order:
-        1) OpenAI embeddings (if OPENAI_API_KEY is configured)
-        2) Local sentence-transformers (all-MiniLM-L6-v2) as fallback
+        1) OpenAI embeddings (if OPENAI_API_KEY configured)
+        2) Local sentence-transformers (BGE small by default)
         """
-
         content = (content or "").strip()
         if not content:
             return np.zeros((settings.EMBEDDING_DIMENSION,), dtype=np.float32)
 
-        if settings.OPENAI_API_KEY:
-            # Lazy import to keep local-only setups lightweight
-            from openai import OpenAI
+        # 1) OpenAI
+        if getattr(settings, "OPENAI_API_KEY", None):
+            from openai import OpenAI  # lazy import
 
             client = OpenAI(api_key=settings.OPENAI_API_KEY)
             resp = client.embeddings.create(
-                model=settings.OPENAI_EMBEDDING_MODEL,
+                model=getattr(settings, "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
                 input=content,
             )
-            vec = np.asarray(resp.data[0].embedding, dtype=np.float32)
-            return _pad_or_truncate(vec, settings.EMBEDDING_DIMENSION)
+            vec = np.array(resp.data[0].embedding, dtype=np.float32)
+            if vec.shape[0] != settings.EMBEDDING_DIMENSION:
+                raise ValueError(
+                    f"OpenAI embedding dim={vec.shape[0]} but settings.EMBEDDING_DIMENSION={settings.EMBEDDING_DIMENSION}. "
+                    "Fix config or DB schema."
+                )
+            return vec
 
-        # Local fallback
+        # 2) Local
         global _ST_MODEL
         if _ST_MODEL is None:
-            from sentence_transformers import SentenceTransformer
+            from sentence_transformers import SentenceTransformer  # lazy import
 
-            _ST_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+            model_name = getattr(settings, "LOCAL_EMBED_MODEL", None) or "BAAI/bge-small-en-v1.5"
+            _ST_MODEL = SentenceTransformer(model_name)
 
         vec = _ST_MODEL.encode(content, normalize_embeddings=True)
-        return _pad_or_truncate(np.asarray(vec, dtype=np.float32), settings.EMBEDDING_DIMENSION)
+        vec = np.asarray(vec, dtype=np.float32)
 
-    # --- Storage API (README names) -------------------------------------------------
+        if vec.shape[0] != settings.EMBEDDING_DIMENSION:
+            raise ValueError(
+                f"Local embedding dim={vec.shape[0]} but settings.EMBEDDING_DIMENSION={settings.EMBEDDING_DIMENSION}. "
+                "Fix config or DB schema."
+            )
+        return vec
 
-    async def store_text_chunks(self, chunks: List[Dict[str, Any]], document_id: int) -> int:
-        """Store a list of chunk dicts (content/page_number/chunk_index/metadata).
+    async def store_chunk(
+        self,
+        content: str,
+        document_id: int,
+        page_number: Optional[int],
+        chunk_index: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> DocumentChunk:
+        """Store one chunk with embedding."""
+        md = metadata or {}
 
-        Returns number of stored chunks.
-        """
+        # If doc processor didn't mark references, infer here (cheap + helpful)
+        if "is_references" not in md:
+            md["is_references"] = bool(_looks_like_references(content))
+
+        emb = await self.generate_embedding(content)
+
+        chunk = DocumentChunk(
+            document_id=document_id,
+            content=content,
+            embedding=emb.tolist(),
+            page_number=page_number,
+            chunk_index=chunk_index,
+            meta=md,
+        )
+        self.db.add(chunk)
+        self.db.commit()
+        self.db.refresh(chunk)
+        return chunk
+
+    async def store_chunks(self, document_id: int, chunks: List[Dict[str, Any]]) -> int:
+        """Store a list of chunks. Returns count stored."""
         stored = 0
         for ch in chunks:
             content = ch.get("content") or ""
+
             raw_page = ch.get("page_number", None)
             page_number = None
-            if raw_page and str(raw_page).strip() != "":
+            if raw_page is not None and str(raw_page).strip() != "":
                 try:
                     p = int(raw_page)
                     page_number = p if p > 0 else None
                 except Exception:
-                    pass
+                    page_number = None
+
             chunk_index = int(ch.get("chunk_index") or stored)
             metadata = ch.get("metadata") or {}
+
             await self.store_chunk(
                 content=content,
                 document_id=document_id,
@@ -128,76 +181,51 @@ class VectorStore:
             stored += 1
         return stored
 
-    async def search_similar(
-        self,
-        query: str,
-        document_id: Optional[int] = None,
-        k: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """Search for chunks similar to query."""
-        return await self.similarity_search(query=query, document_id=document_id, k=k)
-
-    # --- Internal helpers (skeleton names) ------------------------------------------
-
-    async def store_chunk(
-        self,
-        content: str,
-        document_id: int,
-        page_number: Optional[int],
-        chunk_index: int,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> DocumentChunk:
-        """Store a single text chunk with its embedding."""
-        emb = await self.generate_embedding(content)
-        chunk = DocumentChunk(
-            document_id=document_id,
-            content=content,
-            embedding=emb.tolist(),
-            page_number=page_number,
-            chunk_index=chunk_index,
-            meta=metadata or {},
-        )
-        self.db.add(chunk)
-        self.db.commit()
-        self.db.refresh(chunk)
-        return chunk
-
     async def similarity_search(
         self,
         query: str,
         document_id: Optional[int] = None,
-        k: int = 5,
+        k: int = 12,
+        include_references: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Similarity search using pgvector cosine distance."""
+        """
+        Similarity search using pgvector cosine distance.
+        <=> is cosine distance in pgvector. Similarity = 1 - distance.
+        """
         k = int(k or settings.TOP_K_RESULTS)
         k = max(1, min(k, 50))
 
         q_emb = await self.generate_embedding(query)
         q_lit = _to_pgvector_literal(q_emb)
-        # Use SQL for predictable performance and simple score calculation.
-        # <=> is cosine distance in pgvector. Similarity = 1 - distance.
+
         base_sql = """
-                SELECT
-                    id,
-                    content,
-                    page_number,
-                    chunk_index,
-                    metadata,
-                    1 - (embedding <=> (:q)::vector) AS similarity
-                FROM document_chunks
-            """
-        where = ""
+            SELECT
+                id,
+                content,
+                page_number,
+                chunk_index,
+                metadata,
+                1 - (embedding <=> (:q)::vector) AS similarity
+            FROM document_chunks
+        """
+
+        where_clauses: List[str] = []
         params: Dict[str, Any] = {"q": q_lit, "k": k}
+
         if document_id is not None:
-            where = "WHERE document_id = :doc_id"
+            where_clauses.append("document_id = :doc_id")
             params["doc_id"] = int(document_id)
 
-        sql = text(
-            base_sql
-            + "\n"
-            + where
-            + "\nORDER BY embedding <=> (:q)::vector\nLIMIT :k"
-        )
+        if not include_references:
+            # metadata JSONB column is commonly called "metadata" at DB level
+            # your ORM uses meta=... but select uses metadata, matching your existing SQL.
+            where_clauses.append("(metadata->>'is_references') IS DISTINCT FROM 'true'")
+
+        where_sql = ""
+        if where_clauses:
+            where_sql = " WHERE " + " AND ".join(where_clauses)
+
+        sql = text(base_sql + where_sql + " ORDER BY embedding <=> (:q)::vector LIMIT :k")
         rows = self.db.execute(sql, params).mappings().all()
 
         results: List[Dict[str, Any]] = []
@@ -211,17 +239,23 @@ class VectorStore:
                     "page_number": r.get("page_number"),
                     "chunk_index": r.get("chunk_index"),
                     "metadata": md,
-                    "related_images": md.get("related_images", []),
-                    "related_tables": md.get("related_tables", []),
+                    "related_images": (md.get("related_images") or []),
+                    "related_tables": (md.get("related_tables") or []),
                 }
             )
         return results
 
-    async def get_related_content(self, chunk_ids: List[int]) -> Dict[str, List[Dict[str, Any]]]:
-        """Return merged related image/table ids from chunk metadata.
+    async def search_similar(
+        self,
+        query: str,
+        document_id: Optional[int] = None,
+        k: int = 12,
+    ) -> List[Dict[str, Any]]:
+        """Compat wrapper used by ChatEngine."""
+        return await self.similarity_search(query=query, document_id=document_id, k=k)
 
-        The actual DB fetch is handled by ChatEngine to keep this service DB-light.
-        """
+    async def get_related_content(self, chunk_ids: List[int]) -> Dict[str, List[Dict[str, Any]]]:
+        """Return merged related image/table ids from chunk metadata."""
         if not chunk_ids:
             return {"images": [], "tables": []}
 
@@ -233,7 +267,6 @@ class VectorStore:
             image_ids.extend(md.get("related_images", []) or [])
             table_ids.extend(md.get("related_tables", []) or [])
 
-        # De-dupe while keeping order
         def _uniq(xs: List[int]) -> List[int]:
             seen = set()
             out = []

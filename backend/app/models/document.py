@@ -34,7 +34,7 @@ class DocumentChunk(Base):
     id = Column(Integer, primary_key=True, index=True)
     document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     content = Column(Text, nullable=False)
-    embedding = Column(Vector(1536))  # OpenAI embedding dimension
+    embedding = Column(Vector(384))  # OpenAI embedding dimension
     page_number = Column(Integer)
     chunk_index = Column(Integer)
     meta = Column("metadata", JSON)  # {related_images: [...], related_tables: [...], ...}
