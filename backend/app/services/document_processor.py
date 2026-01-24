@@ -323,50 +323,6 @@ class DocumentProcessor:
                 page_to_ids.setdefault(int(page_no), []).append(rec.id)
         return page_to_ids
 
-
-
-
-    def _to_pil_image(self, img_obj: Any) -> Optional[Image.Image]:
-        
-        for attr in ("pil_image", "image", "value"):
-            v = getattr(img_obj, attr, None)
-            if isinstance(v, Image.Image):
-                return v
-
-        
-        raw = getattr(img_obj, "data", None) or getattr(img_obj, "bytes", None)
-        if isinstance(raw, (bytes, bytearray)):
-            try:
-                return Image.open(io.BytesIO(raw)).convert("RGB")
-            except Exception:
-                return None
-
-        
-        for attr in ("uri", "path", "file_path", "filepath", "filename"):
-            p = getattr(img_obj, attr, None)
-            if isinstance(p, str) and p:
-                if p.startswith("file://"):
-                    p = p.replace("file://", "", 1)
-                p = os.path.expanduser(p)
-                if os.path.exists(p):
-                    try:
-                        return Image.open(p).convert("RGB")
-                    except Exception:
-                        pass
-
-        
-        for fn in ("to_pil", "to_pil_image"):
-            f = getattr(img_obj, fn, None)
-            if callable(f):
-                try:
-                    out = f()
-                    if isinstance(out, Image.Image):
-                        return out
-                except Exception:
-                    pass
-
-        return None
-
     # --------------------------- Table extraction ---------------------------
 
     async def _extract_tables(self, doc: Any, document_id: int) -> Dict[int, List[int]]:
@@ -412,63 +368,6 @@ class DocumentProcessor:
             page_to_ids.setdefault(page_key, []).append(rec.id)
 
         return page_to_ids
-
-    def _infer_item_page(self, item: Any) -> Optional[int]:
-        """Best-effort page inference for Docling items."""
-        for attr in ("page_number", "page", "page_num"):
-            v = getattr(item, attr, None)
-            if v is not None:
-                try:
-                    return int(v)
-                except Exception:
-                    pass
-
-        
-        prov = getattr(item, "prov", None) or getattr(item, "provenance", None)
-        if prov is not None:
-            
-            try:
-                prov0 = prov[0] if isinstance(prov, (list, tuple)) and prov else prov
-            except Exception:
-                prov0 = prov
-            for attr in ("page_number", "page", "page_no", "page_num"):
-                v = getattr(prov0, attr, None)
-                if v is not None:
-                    try:
-                        return int(v)
-                    except Exception:
-                        pass
-            
-            if isinstance(prov0, dict):
-                for k in ("page_number", "page", "page_no", "page_num"):
-                    if k in prov0:
-                        try:
-                            return int(prov0[k])
-                        except Exception:
-                            pass
-
-        return None
-
-
-    def _infer_bbox_xyxy(self, item: Any):
-        """Try to read bbox as (x0,y0,x1,y1). Returns None if not available."""
-        bbox = getattr(item, "bbox", None) or getattr(item, "bounding_box", None) or getattr(item, "box", None)
-        if bbox is None:
-            return None
-
-        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-            return bbox
-
-        if isinstance(bbox, dict):
-            keys = ("x0", "y0", "x1", "y1")
-            if all(k in bbox for k in keys):
-                return (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
-
-        
-        try:
-            return (bbox.x0, bbox.y0, bbox.x1, bbox.y1)
-        except Exception:
-            return None
 
     def _table_to_structured_docling(self, tbl: Any, doc: Any) -> Optional[Dict[str, Any]]:
         """
