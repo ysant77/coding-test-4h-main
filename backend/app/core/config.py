@@ -33,10 +33,16 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE: int = 50 * 1024 * 1024  # 50 MB
     
     # Vector Store Settings
-    EMBEDDING_DIMENSION: int = 1536  # OpenAI text-embedding-3-small
-    CHUNK_SIZE: int = 1000
-    CHUNK_OVERLAP: int = 200
-    TOP_K_RESULTS: int = 5
+    # Vector Store Settings
+    EMBEDDING_DIMENSION: int = 384          # was 1536
+    TOP_K_RESULTS: int = 16                # was 5
+    CHUNK_SIZE: int = 1800                 # optional but recommended
+    CHUNK_OVERLAP: int = 250               # keep as-is or 200-250
+    ENABLE_RERANKER : bool = True
+    RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    LOCAL_EMBED_MODEL:str = "BAAI/bge-small-en-v1.5"
+    
+
     
     class Config:
         env_file = ".env"

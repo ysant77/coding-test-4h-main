@@ -1,33 +1,44 @@
-"""app.services.chat_engine
-
-Multimodal RAG chat engine.
-
-Core flow:
-1) Load recent conversation history
-2) Retrieve relevant chunks from VectorStore
-3) Fetch related images/tables based on chunk metadata
-4) Generate response with an LLM (OpenAI if configured, otherwise Ollama)
-5) Return answer + formatted sources
-"""
-
 from __future__ import annotations
 
 import os
 import time
 from typing import Any, Dict, List, Optional
 
-import httpx
+import requests
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.conversation import Conversation, Message
+from app.models.conversation import Message
 from app.models.document import DocumentImage, DocumentTable
 from app.services.vector_store import VectorStore
 
 
-class ChatEngine:
-    """Multimodal chat engine with RAG."""
+def _safe_trim(s: str, n: int = 900) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 3].rstrip() + "..."
 
+
+def _expand_query(q: str) -> List[str]:
+    ql = (q or "").lower()
+    out = [q]
+
+    # Target typical academic sections
+    if any(k in ql for k in ["main conclusion", "conclusion", "conclude", "summary", "key takeaway"]):
+        out.append(q + " conclusion summary key takeaway contribution")
+        out.append("conclusion summary contribution " + q)
+    if any(k in ql for k in ["main contribution", "contribution", "novelty", "what does this paper propose"]):
+        out.append(q + " main contribution novelty propose introduce")
+        out.append("introduction contributions " + q)
+    if any(k in ql for k in ["architecture", "diagram", "model", "pipeline", "figure"]):
+        out.append(q + " figure architecture model encoder decoder attention")
+        out.append("figure caption architecture " + q)
+
+    # Always add a lightweight “section anchor” query to bias towards useful text
+    out.append(q + " abstract introduction conclusion")
+    return list(dict.fromkeys(out))  # dedupe preserve order
+
+
+class ChatEngine:
     def __init__(self, db: Session):
         self.db = db
         self.vector_store = VectorStore(db)
@@ -180,90 +191,85 @@ class ChatEngine:
             self.db.query(Message)
             .filter(Message.conversation_id == conversation_id)
             .order_by(Message.created_at.desc())
-            .limit(max(0, int(limit)))
+            .limit(int(limit))
             .all()
         )
-        msgs = list(reversed(msgs))
-        return [{"role": m.role, "content": m.content} for m in msgs]
+        q = list(reversed(q))
+        return [{"role": m.role, "content": m.content} for m in q]
 
-    async def _search_context(
-        self,
-        query: str,
-        document_id: Optional[int] = None,
-        k: int = 5,
-    ) -> List[Dict[str, Any]]:
-        return await self.vector_store.search_similar(query=query, document_id=document_id, k=k)
+    async def _search_context(self, query: str, document_id: Optional[int], k: Optional[int] = None) -> List[Dict[str, Any]]:
+        k_final = int(k or settings.TOP_K_RESULTS or 16)
+        k_final = max(6, min(k_final, 24))
+
+        # Retrieve a good pool per query, then union them
+        candidates: List[Dict[str, Any]] = []
+        seen = set()
+
+        expanded = _expand_query(query)
+        per_query_k = min(25, max(12, k_final))  # each query gives a small pool
+
+        for q in expanded[:4]:  # cap to avoid over-retrieving
+            res = await self.vector_store.search_similar(query=q, document_id=document_id, k=per_query_k)
+            for ch in res:
+                cid = ch.get("id")
+                if cid is None or cid in seen:
+                    continue
+                seen.add(cid)
+                candidates.append(ch)
+
+        # Optional rerank
+        candidates = await self._maybe_rerank(query, candidates)
+
+        return candidates[:k_final]
+
+    async def _maybe_rerank(self, query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        enable = bool(getattr(settings, "ENABLE_RERANKER", False))
+        if not enable or not chunks:
+            # sort by vector score if no reranker
+            return sorted(chunks, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+        except Exception:
+            return sorted(chunks, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+        model_name = getattr(settings, "RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        try:
+            reranker = CrossEncoder(model_name)
+        except Exception:
+            return sorted(chunks, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+        pairs = [(query, ch.get("content", "")) for ch in chunks]
+        scores = reranker.predict(pairs)  # higher better
+
+        merged = []
+        for ch, s in zip(chunks, scores):
+            ch2 = dict(ch)
+            ch2["_rerank"] = float(s)
+            merged.append(ch2)
+
+        merged.sort(key=lambda x: (x.get("_rerank", 0.0), float(x.get("score") or 0.0)), reverse=True)
+        return merged
 
     async def _find_related_media(self, context_chunks: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        
-
-        # 1) Prefer explicit IDs attached to chunks (most reliable)
-        image_ids: List[int] = []
-        table_ids: List[int] = []
-
+        pages = []
         for ch in context_chunks:
-            md = ch.get("meta") or {}
-            image_ids.extend(md.get("related_images", []) or [])
-            table_ids.extend(md.get("related_tables", []) or [])
-
-            # backward-compat in case metadata got flattened
-            image_ids.extend(ch.get("related_images", []) or [])
-            table_ids.extend(ch.get("related_tables", []) or [])
-
-        # de-dupe while keeping order
-        def _uniq(xs: List[int]) -> List[int]:
-            seen = set()
-            out = []
-            for x in xs:
-                try:
-                    xi = int(x)
-                except Exception:
-                    continue
-                if xi in seen:
-                    continue
-                seen.add(xi)
-                out.append(xi)
-            return out
-
-        image_ids = _uniq(image_ids)[:12]
-        table_ids = _uniq(table_ids)[:12]
+            p = ch.get("page_number")
+            if isinstance(p, int) and p >= 1:
+                pages.append(p)
+        pages = list(dict.fromkeys(pages))
 
         images: List[Dict[str, Any]] = []
+        if pages:
+            rows = self.db.query(DocumentImage).filter(DocumentImage.page_number.in_(pages)).all()
+            for r in rows[:8]:
+                images.append({"id": r.id, "url": f"/uploads/images/{os.path.basename(r.file_path)}", "caption": r.caption, "page": r.page_number})
+
         tables: List[Dict[str, Any]] = []
-
-        if image_ids:
-            rows = self.db.query(DocumentImage).filter(DocumentImage.id.in_(image_ids)).all()
-            # keep stable order by ids
-            row_by_id = {r.id: r for r in rows}
-            for iid in image_ids:
-                r = row_by_id.get(iid)
-                if not r:
-                    continue
-                images.append(
-                    {
-                        "id": r.id,
-                        "url": f"/uploads/images/{os.path.basename(r.file_path)}",
-                        "caption": r.caption,
-                        "page": r.page_number,
-                    }
-                )
-
-        if table_ids:
-            rows = self.db.query(DocumentTable).filter(DocumentTable.id.in_(table_ids)).all()
-            row_by_id = {r.id: r for r in rows}
-            for tid in table_ids:
-                r = row_by_id.get(tid)
-                if not r:
-                    continue
-                tables.append(
-                    {
-                        "id": r.id,
-                        "url": f"/uploads/tables/{os.path.basename(r.image_path)}",
-                        "caption": r.caption,
-                        "page": r.page_number,
-                        "data": r.data,
-                    }
-                )
+        if pages:
+            rows = self.db.query(DocumentTable).filter(DocumentTable.page_number.in_(pages)).all()
+            for r in rows[:5]:
+                tables.append({"id": r.id, "url": f"/uploads/tables/{os.path.basename(r.image_path)}", "caption": r.caption, "page": r.page_number, "data": r.data})
 
         # 2) Fallback: pages from retrieved chunks (coarse)
         if not images and not tables:
@@ -306,138 +312,81 @@ class ChatEngine:
 
         return {"images": images, "tables": tables}
 
-
-
     async def _generate_response(
         self,
         message: str,
-        context: List[Dict[str, Any]],
-        history: List[Dict[str, str]],
+        history: List[Dict[str, Any]],
+        context_chunks: List[Dict[str, Any]],
         media: Dict[str, List[Dict[str, Any]]],
     ) -> str:
-        # Build a compact context block
-        ctx_lines: List[str] = []
-        for i, ch in enumerate(context[:8], start=1):
-            page = ch.get("page_number")
-            page_str = str(page) if page else "unknown"
-            score = ch.get("score")
-            snippet = (ch.get("content") or "").strip()
-            snippet = snippet[:1200]
-            ctx_lines.append(f"[{i}] (page {page_str}, score {score:.3f}) {snippet}")
-        ctx_block = "\n\n".join(ctx_lines) if ctx_lines else "(no relevant context found)"
+        # Build context block
+        if context_chunks:
+            ctx_lines = []
+            for i, ch in enumerate(context_chunks, start=1):
+                pg = ch.get("page_number")
+                sc = float(ch.get("score") or 0.0)
+                snippet = _safe_trim(ch.get("content", ""), 900)
+                ctx_lines.append(f"[{i}] (page={pg}, score={sc:.3f}) {snippet}")
+            ctx_block = "\n\n".join(ctx_lines)
+        else:
+            ctx_block = "NO_CONTEXT_FOUND"
 
-        media_hint = []
-        if media.get("images"):
-            media_hint.append(f"Images available: {len(media['images'])} (refer by page when relevant)")
-        table_block = ""
-        if media.get("tables"):
-            lines = []
-            for t in media["tables"][:3]:
-                cap = (t.get("caption") or "").strip()
-                pg = t.get("page")
-                data = t.get("data") or []
-                # keep it compact
-                preview = data[:8] if isinstance(data, list) else []
-                lines.append(f"- Table (page {pg}) {cap}\n  preview: {preview}")
-            table_block = "\n\nTables preview:\n" + "\n".join(lines)
-        media_hint_block = "\n".join(media_hint) if media_hint else "No images/tables extracted for this context."
+        compact_hist = []
+        for h in history[-6:]:
+            role = h.get("role", "")
+            content = _safe_trim(h.get("content", ""), 350)
+            compact_hist.append(f"{role}: {content}")
+        hist_block = "\n".join(compact_hist)
 
         system = (
-            "You are a helpful assistant answering questions about an uploaded PDF. "
-            "Use the provided context snippets as the source of truth. "
-            "If the answer is not in the context, say you don't know. "
-            "When useful, mention relevant pages and refer to tables/figures by page."
+            "You answer questions about an uploaded document.\n"
+            "Rules:\n"
+            "- Use ONLY the retrieved context snippets.\n"
+            "- If the answer is not present, say you don't know.\n"
+            "- If asked about architecture/diagram/figure, search the context for figure captions and describe what it says.\n"
+            "- When possible, mention the most relevant page numbers.\n"
         )
-        
 
         user = (
+            f"Conversation history:\n{hist_block}\n\n"
             f"User question: {message}\n\n"
-            f"Retrieved context:\n{ctx_block}\n\n"
-            f"Media info:\n{media_hint_block}\n\n"
-            f"{table_block}\n\n"
-            "Answer clearly and concisely."
+            f"Retrieved context:\n{ctx_block}\n"
         )
 
-        # Choose LLM provider: OpenAI if configured, otherwise Ollama
-        if settings.OPENAI_API_KEY:
+        # OpenAI
+        if getattr(settings, "OPENAI_API_KEY", None):
             from openai import OpenAI
 
             client = OpenAI(api_key=settings.OPENAI_API_KEY)
-            messages = [{"role": "system", "content": system}]
-            # include short history (excluding the current user message which is already passed)
-            for h in history[-6:]:
-                if h.get("role") in ("user", "assistant") and h.get("content"):
-                    messages.append({"role": h["role"], "content": h["content"]})
-            messages.append({"role": "user", "content": user})
-
-            resp = client.chat.completions.create(model=settings.OPENAI_MODEL, messages=messages)
+            resp = client.chat.completions.create(
+                model=getattr(settings, "OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0.2,
+            )
             return (resp.choices[0].message.content or "").strip()
 
-        # Ollama local LLM
-        return await self._ollama_chat(system=system, history=history, user=user)
+        # Ollama
+        url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
+        payload = {
+            "model": settings.OLLAMA_MODEL,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "options": {"temperature": 0.2},
+            "stream": False,
+        }
+        r = requests.post(url, json=payload, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        return (data.get("message", {}) or {}).get("content", "").strip()
 
-    async def _ollama_chat(self, system: str, history: List[Dict[str, str]], user: str) -> str:
-        # Ollama chat API: POST /api/chat
-        url = settings.OLLAMA_BASE_URL.rstrip("/") + "/api/chat"
-
-        messages = [{"role": "system", "content": system}]
-        for h in history[-6:]:
-            role = h.get("role")
-            if role not in ("user", "assistant"):
-                continue
-            content = (h.get("content") or "").strip()
-            if content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": user})
-
-        payload = {"model": settings.OLLAMA_MODEL, "messages": messages, "stream": False}
-
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                r = await client.post(url, json=payload)
-                r.raise_for_status()
-                data = r.json()
-                # { message: { role, content }, ... }
-                return (data.get("message", {}) or {}).get("content", "").strip() or ""
-        except Exception as e:
-            return (
-                "LLM is not configured or unreachable. "
-                f"If using Ollama, ensure it's running at {settings.OLLAMA_BASE_URL}. "
-                f"Error: {e}"
-            )
-
-    def _format_sources(self, context: List[Dict[str, Any]], media: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    def _format_sources(self, context_chunks: List[Dict[str, Any]], media: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
         sources: List[Dict[str, Any]] = []
+        for ch in context_chunks[:10]:
+            sources.append({"type": "text", "page": ch.get("page_number"), "score": ch.get("score"), "snippet": _safe_trim(ch.get("content", ""), 280)})
 
-        for chunk in context[:3]:
-            sources.append(
-                {
-                    "type": "text",
-                    "content": chunk.get("content"),
-                    "page": chunk.get("page_number"),
-                    "score": chunk.get("score", 0.0),
-                }
-            )
-
-        for image in media.get("images", [])[:5]:
-            sources.append(
-                {
-                    "type": "image",
-                    "url": image.get("url"),
-                    "caption": image.get("caption"),
-                    "page": image.get("page"),
-                }
-            )
+        for img in media.get("images", [])[:5]:
+            sources.append({"type": "image", "url": img.get("url"), "caption": img.get("caption"), "page": img.get("page")})
 
         for table in media.get("tables", [])[:5]:
-            sources.append(
-                {
-                    "type": "table",
-                    "url": table.get("url"),
-                    "caption": table.get("caption"),
-                    "page": table.get("page"),
-                    "data": table.get("data"),
-                }
-            )
+            sources.append({"type": "table", "url": table.get("url"), "caption": table.get("caption"), "page": table.get("page"), "data": table.get("data")})
 
         return sources
